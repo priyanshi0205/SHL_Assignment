@@ -24,6 +24,17 @@ BOOST_KEYWORDS: List[str] = [
     "programming",
     "stakeholder",
 ]
+TECHNICAL_EXACT_KEYWORDS: List[str] = [
+    "python",
+    "java",
+    "sql",
+    "backend",
+    "frontend",
+    "api",
+    "developer",
+    "engineer",
+    "analyst",
+]
 PRODUCT_ALIASES: dict[str, str] = {
     "opq": "Occupational Personality Questionnaire OPQ32r",
     "opq32r": "Occupational Personality Questionnaire OPQ32r",
@@ -504,6 +515,106 @@ def compute_overlap_count(text: str, keywords: List[str]) -> int:
     return sum(1 for keyword in keywords if keyword in text)
 
 
+def extract_present_keywords(query: str, keywords: List[str]) -> List[str]:
+    lowered_query: str = query.lower()
+    present: List[str] = []
+    for keyword in keywords:
+        if re.search(rf"\b{re.escape(keyword)}\b", lowered_query):
+            present.append(keyword)
+    return present
+
+
+def exact_keyword_boost(
+    assessment: dict[str, Any], present_keywords: List[str]
+) -> float:
+    if not present_keywords:
+        return 0.0
+
+    name_text: str = str(assessment.get("name", "")).lower()
+    desc_text: str = str(assessment.get("description", "")).lower()
+    tags_text: str = " ".join(str(tag).lower() for tag in assessment.get("tags", []))
+
+    exact_hits_name: int = 0
+    exact_hits_tags: int = 0
+    exact_hits_desc: int = 0
+
+    for keyword in present_keywords:
+        if re.search(rf"\b{re.escape(keyword)}\b", name_text):
+            exact_hits_name += 1
+        if re.search(rf"\b{re.escape(keyword)}\b", tags_text):
+            exact_hits_tags += 1
+        if re.search(rf"\b{re.escape(keyword)}\b", desc_text):
+            exact_hits_desc += 1
+
+    boost = (1.50 * exact_hits_name) + (1.10 * exact_hits_tags) + (0.75 * exact_hits_desc)
+    return boost
+
+
+def assessment_contains_keyword(assessment: dict[str, Any], keyword: str) -> bool:
+    combined: str = " ".join(
+        [
+            str(assessment.get("name", "")).lower(),
+            str(assessment.get("description", "")).lower(),
+            " ".join(str(tag).lower() for tag in assessment.get("tags", [])),
+        ]
+    )
+    return bool(re.search(rf"\b{re.escape(keyword)}\b", combined))
+
+
+def ensure_exact_keyword_coverage(
+    selected_indices: List[int], present_keywords: List[str], max_items: int
+) -> List[int]:
+    if not present_keywords or not selected_indices:
+        return selected_indices[:max_items]
+
+    selected_items: List[dict[str, Any]] = [catalog_data[idx] for idx in selected_indices]
+    missing_keywords: List[str] = []
+    for keyword in present_keywords:
+        if not any(assessment_contains_keyword(item, keyword) for item in selected_items):
+            missing_keywords.append(keyword)
+
+    updated_indices: List[int] = selected_indices.copy()
+    # Add up to two missing keyword anchors to avoid over-forcing ranking.
+    for keyword in missing_keywords[:2]:
+        candidate = best_keyword_technical_assessment(keyword)
+        if candidate is None:
+            continue
+        candidate_idx: Optional[int] = None
+        for i, item in enumerate(catalog_data):
+            if item is candidate:
+                candidate_idx = i
+                break
+        if candidate_idx is None or candidate_idx in updated_indices:
+            continue
+        updated_indices = [candidate_idx] + updated_indices
+        updated_indices = updated_indices[:max_items]
+
+    return updated_indices[:max_items]
+
+
+def best_keyword_technical_assessment(keyword: str) -> Optional[dict[str, Any]]:
+    best: Optional[dict[str, Any]] = None
+    best_score: float = -1.0
+    for assessment in catalog_data:
+        if not is_technical_assessment(assessment):
+            continue
+        name_text: str = str(assessment.get("name", "")).lower()
+        desc_text: str = str(assessment.get("description", "")).lower()
+        tags_text: str = " ".join(str(tag).lower() for tag in assessment.get("tags", []))
+        combined: str = " ".join([name_text, tags_text, desc_text])
+        if not re.search(rf"\b{re.escape(keyword)}\b", combined):
+            continue
+        score = (
+            (2.0 if re.search(rf"\b{re.escape(keyword)}\b", name_text) else 0.0)
+            + (1.5 if re.search(rf"\b{re.escape(keyword)}\b", tags_text) else 0.0)
+            + (1.0 if re.search(rf"\b{re.escape(keyword)}\b", desc_text) else 0.0)
+        )
+        if score > best_score:
+            best = assessment
+            best_score = score
+    return best
+
+
 def lexical_rank_assessments(query: str, top_k: int) -> List[dict[str, Any]]:
     lowered_query: str = query.lower()
     query_tokens: set[str] = {
@@ -681,6 +792,9 @@ def search_assessments(query: str, top_k: int = 5) -> List[dict[str, Any]]:
     matched_keywords: List[str] = [
         keyword for keyword in BOOST_KEYWORDS if keyword in lowered_query
     ]
+    present_technical_keywords: List[str] = extract_present_keywords(
+        lowered_query, TECHNICAL_EXACT_KEYWORDS
+    )
     exclusion_terms: List[str] = extract_exclusion_terms(lowered_query)
 
     # Re-rank FAISS candidates with deterministic keyword overlap boosting.
@@ -713,7 +827,8 @@ def search_assessments(query: str, top_k: int = 5) -> List[dict[str, Any]]:
         boost_score: float = (
             (0.85 * tag_overlap) + (0.50 * description_overlap) + (0.25 * total_overlap)
         )
-        final_score: float = semantic_score + boost_score
+        exact_boost = exact_keyword_boost(assessment, present_technical_keywords)
+        final_score: float = semantic_score + boost_score + exact_boost
         scored_candidates.append((final_score, idx))
 
     scored_candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -724,6 +839,10 @@ def search_assessments(query: str, top_k: int = 5) -> List[dict[str, Any]]:
             unique_indices.append(idx)
         if len(unique_indices) >= bounded_top_k:
             break
+
+    unique_indices = ensure_exact_keyword_coverage(
+        unique_indices, present_technical_keywords, bounded_top_k
+    )
 
     return [catalog_data[idx] for idx in unique_indices]
 
