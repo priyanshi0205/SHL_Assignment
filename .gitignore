@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+evaluation_results.json
+catalog_full.json
+GenAI_SampleConversations/  
